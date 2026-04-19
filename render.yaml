@@ -1,0 +1,53 @@
+services:
+  - type: web
+    name: rag-ingestion-pipeline
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter                 # upgrade to "standard" for more RAM/CPU
+    healthCheckPath: /health
+    envVars:
+      # ── Required ─────────────────────────────────────────────────────────
+      - key: AZURE_CONNECTION_STRING
+        sync: false               # set in Render dashboard → "Secret"
+      - key: AZURE_CONTAINER_NAME
+        value: vectordbforrag
+      - key: API_KEY
+        sync: false               # set in Render dashboard → "Secret"
+
+      # ── Embedding model ───────────────────────────────────────────────────
+      - key: EMBEDDING_MODEL
+        value: sentence-transformers/all-MiniLM-L12-v2
+      - key: TRANSFORMERS_NO_TF
+        value: "1"
+      - key: TRANSFORMERS_NO_FLAX
+        value: "1"
+      - key: TRANSFORMERS_CACHE
+        value: /app/.cache/huggingface
+
+      # ── Chunking ──────────────────────────────────────────────────────────
+      - key: CHUNK_SIZE
+        value: "500"
+      - key: CHUNK_OVERLAP
+        value: "50"
+
+      # ── File handling ─────────────────────────────────────────────────────
+      - key: MAX_UPLOAD_SIZE_MB
+        value: "50"
+      - key: ENABLE_FAISS_BACKUP
+        value: "false"
+
+      # ── CORS ──────────────────────────────────────────────────────────────
+      - key: CORS_ORIGINS
+        value: "*"                # restrict to your admin panel domain in production
+
+      # ── Google Drive (optional) ───────────────────────────────────────────
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false               # paste your service account JSON content here
+
+      # ── SharePoint (optional) ─────────────────────────────────────────────
+      - key: SHAREPOINT_TENANT_ID
+        sync: false
+      - key: SHAREPOINT_CLIENT_ID
+        sync: false
+      - key: SHAREPOINT_CLIENT_SECRET
+        sync: false
