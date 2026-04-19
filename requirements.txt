@@ -6,8 +6,9 @@ python-dotenv
 
 azure-storage-blob
 
-transformers
-sentence-transformers
+torch==2.2.0
+transformers==4.38.2
+sentence-transformers==2.6.1
 faiss-cpu
 
 langchain-text-splitters
