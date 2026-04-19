@@ -14,7 +14,6 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libgomp1 \
         curl \
-        libreoffice \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir \
@@ -27,13 +26,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 RUN mkdir -p /app/tmp /app/.cache/huggingface
-
-RUN python -c "\
-from sentence_transformers import SentenceTransformer; \
-import os; \
-model_name = os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L12-v2'); \
-SentenceTransformer(model_name); \
-"
 
 EXPOSE 8000
 
