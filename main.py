@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+import os
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+from sentence_transformers import SentenceTransformer
 
 from config import Config
 from api.routers import ingest, storage
@@ -16,23 +19,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Global model ───────────────────────────────────────────────────────────────
+
+embedding_model: SentenceTransformer | None = None
+
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global embedding_model
+
     logger.info("═══ RAG Ingestion Pipeline starting ═══")
 
     errors = Config.validate()
     for err in errors:
         logger.warning("⚠  Config: %s", err)
 
-    # Pre-warm embedding model (avoids timeout on first request)
+    # Preload embedding model (Render-safe)
     try:
-        from services.pipeline import get_embedder
-        logger.info("Pre-loading embedding model: %s", Config.EMBEDDING_MODEL)
-        get_embedder()
-        logger.info("✔ Embedding model ready")
+        model_name = os.getenv(
+            "EMBEDDING_MODEL",
+            "sentence-transformers/all-MiniLM-L12-v2"
+        )
+
+        logger.info("Loading embedding model: %s", model_name)
+
+        embedding_model = SentenceTransformer(model_name)
+
+        logger.info("✔ Embedding model loaded successfully")
+
     except Exception as exc:
         logger.error("Embedding model failed to load: %s", exc)
 
@@ -94,13 +110,12 @@ async def root():
     return {
         "service": "RAG Ingestion Pipeline API",
         "version": "2.0.0",
-        "docs":    "/docs",
-        "health":  "/health",
+        "docs": "/docs",
+        "health": "/health",
         "sources": ["local-directory", "upload-file", "google-drive", "sharepoint"],
     }
 
 
 @app.get("/health", tags=["Health"], summary="Liveness probe")
 async def health():
-    """Used by Render / Docker health checks. Returns 200 while alive."""
     return {"status": "ok"}
