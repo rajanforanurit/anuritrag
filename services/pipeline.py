@@ -38,13 +38,16 @@ def get_blob_svc() -> BlobStorageService:
         )
     return _blob_svc
 
-
 def get_embedder() -> EmbeddingService:
     global _embedder
     if _embedder is None:
-        _embedder = EmbeddingService(model_name=Config.EMBEDDING_MODEL)
-    return _embedder
+        from main import embedding_model
+        if embedding_model is None:
+            raise RuntimeError("Model not loaded at startup")
 
+        _embedder = EmbeddingService(model=embedding_model)
+
+    return _embedder
 
 def get_chunker() -> Chunker:
     global _chunker
