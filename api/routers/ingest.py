@@ -187,7 +187,7 @@ async def upload_and_ingest_file(
     description=(
         "Fetches all supported files from a Google Drive folder (by folder ID), "
         "downloads them to a temporary directory, then runs the full ingestion pipeline. "
-        "Requires `GOOGLE_SERVICE_ACCOUNT_JSON` or `GOOGLE_CREDENTIALS_FILE` in .env. "
+        "Requires `GOOGLE_SERVICE_ACCOUNT_JSON` in .env. "
         "The folder ID is the last part of the Drive folder URL: "
         "`https://drive.google.com/drive/folders/<FOLDER_ID>`"
     ),
@@ -200,13 +200,12 @@ async def ingest_google_drive(
     logger.info("[%s] ingest/google-drive — folder_id=%s", request_id, body.folder_id)
 
     # Validate credentials are configured
-    if not Config.GOOGLE_SERVICE_ACCOUNT_JSON and not Config.GOOGLE_CREDENTIALS_FILE:
+    if not Config.GOOGLE_SERVICE_ACCOUNT_JSON:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 "Google Drive credentials are not configured. "
-                "Set GOOGLE_SERVICE_ACCOUNT_JSON (service account JSON content) "
-                "or GOOGLE_CREDENTIALS_FILE (path to credentials JSON) in .env."
+                "Set GOOGLE_SERVICE_ACCOUNT_JSON (service account JSON content) in .env."
             ),
         )
 
@@ -324,8 +323,8 @@ async def ingest_sharepoint(
     extra_meta = dict(body.extra_metadata or {})
     if body.label:
         extra_meta["ingest_label"] = body.label
-    extra_meta["request_id"]       = request_id
-    extra_meta["sharepoint_site"]  = body.site_url
+    extra_meta["request_id"]        = request_id
+    extra_meta["sharepoint_site"]   = body.site_url
     extra_meta["sharepoint_folder"] = body.folder_path
 
     try:
