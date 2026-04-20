@@ -1,18 +1,19 @@
 fastapi
 uvicorn[standard]
 python-multipart
+
 python-dotenv
+
 azure-storage-blob
 
-onnxruntime
-optimum[onnxruntime]
-transformers
-numpy
-
+torch==2.2.0
+transformers==4.38.2
+sentence-transformers==2.6.1
 faiss-cpu
 
 langchain-text-splitters
 
+numpy
 pandas
 openpyxl
 xlrd
