@@ -1,50 +1,58 @@
-"""
-services/blob_storage.py — Azure Blob Storage service.
-
-Covers: upload (file / bytes), download, list, delete, existence check, URL helper.
-All public methods return structured dicts or raise — callers decide how to surface errors.
-"""
-
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import List, Optional
+
+from config import Config
 
 logger = logging.getLogger(__name__)
 
 
 class BlobStorageService:
-    """Thin, dependency-free wrapper around azure-storage-blob."""
-
     def __init__(self, connection_string: str, container_name: str) -> None:
         if not connection_string:
             raise ValueError("AZURE_CONNECTION_STRING must not be empty.")
-        self._conn_str  = connection_string
-        self._container = container_name
-        self._client    = None   # lazy — created on first access
 
-    # ── Client lifecycle ───────────────────────────────────────────────────
+        self._conn_str = connection_string
+        self._container = container_name
+        self._client = None
 
     @property
     def client(self):
-        """Lazy-initialised ContainerClient."""
         if self._client is None:
             from azure.storage.blob import BlobServiceClient
-            svc          = BlobServiceClient.from_connection_string(self._conn_str)
-            self._client = svc.get_container_client(self._container)
+
+            service = BlobServiceClient.from_connection_string(self._conn_str)
+            self._client = service.get_container_client(self._container)
             self._ensure_container()
+
         return self._client
 
     def _ensure_container(self) -> None:
         try:
             self._client.create_container()
-            logger.info("Container '%s' created.", self._container)
+            logger.info("Container created: %s", self._container)
         except Exception as exc:
             if "ContainerAlreadyExists" not in str(exc):
-                logger.debug("Container pre-check: %s", exc)
+                logger.debug("Container check skipped: %s", str(exc))
 
-    # ── Upload ─────────────────────────────────────────────────────────────
+    def build_client_blob_path(
+        self,
+        client_id: str,
+        filename: str,
+        prefix: str = "raw",
+    ) -> str:
+        if not client_id:
+            raise ValueError("client_id is required")
+
+        client_id = client_id.strip().lower()
+        filename = Path(filename).name.strip()
+
+        if not filename:
+            raise ValueError("filename is required")
+
+        return f"{prefix}/{client_id}/{filename}"
 
     def upload_file(
         self,
@@ -52,15 +60,75 @@ class BlobStorageService:
         blob_name: str,
         overwrite: bool = True,
     ) -> dict:
-        """Upload a local file. Returns {'success', 'blob_name', 'blob_url'} or 'error'."""
         try:
-            with open(local_path, "rb") as fh:
-                self.client.upload_blob(name=blob_name, data=fh, overwrite=overwrite)
-            logger.debug("Uploaded file → %s", blob_name)
-            return {"success": True, "blob_name": blob_name, "blob_url": self._url(blob_name)}
+            if not local_path.exists():
+                return {
+                    "success": False,
+                    "blob_name": blob_name,
+                    "error": f"Local file not found: {str(local_path)}",
+                }
+
+            with open(local_path, "rb") as file_handle:
+                self.client.upload_blob(
+                    name=blob_name,
+                    data=file_handle,
+                    overwrite=overwrite,
+                )
+
+            logger.info("Uploaded file to blob: %s", blob_name)
+
+            return {
+                "success": True,
+                "blob_name": blob_name,
+                "blob_url": self._url(blob_name),
+            }
+
         except Exception as exc:
-            logger.error("upload_file failed '%s': %s", blob_name, exc)
-            return {"success": False, "blob_name": blob_name, "error": str(exc)}
+            logger.error(
+                "upload_file failed | blob=%s | error=%s",
+                blob_name,
+                str(exc),
+            )
+
+            return {
+                "success": False,
+                "blob_name": blob_name,
+                "error": str(exc),
+            }
+
+    def upload_file_for_client(
+        self,
+        client_id: str,
+        local_path: Path,
+        prefix: str = "raw",
+        overwrite: bool = True,
+    ) -> dict:
+        try:
+            blob_name = self.build_client_blob_path(
+                client_id=client_id,
+                filename=local_path.name,
+                prefix=prefix,
+            )
+
+            return self.upload_file(
+                local_path=local_path,
+                blob_name=blob_name,
+                overwrite=overwrite,
+            )
+
+        except Exception as exc:
+            logger.error(
+                "upload_file_for_client failed | client_id=%s | file=%s | error=%s",
+                client_id,
+                str(local_path),
+                str(exc),
+            )
+
+            return {
+                "success": False,
+                "blob_name": "",
+                "error": str(exc),
+            }
 
     def upload_bytes(
         self,
@@ -69,108 +137,225 @@ class BlobStorageService:
         content_type: str = "application/octet-stream",
         overwrite: bool = True,
     ) -> dict:
-        """Upload raw bytes. Returns {'success', 'blob_name', 'blob_url'} or 'error'."""
         try:
             from azure.storage.blob import ContentSettings
+
             self.client.upload_blob(
                 name=blob_name,
                 data=data,
                 overwrite=overwrite,
-                content_settings=ContentSettings(content_type=content_type),
+                content_settings=ContentSettings(
+                    content_type=content_type
+                ),
             )
-            logger.debug("Uploaded bytes → %s (%d B)", blob_name, len(data))
-            return {"success": True, "blob_name": blob_name, "blob_url": self._url(blob_name)}
-        except Exception as exc:
-            logger.error("upload_bytes failed '%s': %s", blob_name, exc)
-            return {"success": False, "blob_name": blob_name, "error": str(exc)}
 
-    # ── Download ───────────────────────────────────────────────────────────
+            logger.info(
+                "Uploaded bytes to blob: %s (%d bytes)",
+                blob_name,
+                len(data),
+            )
+
+            return {
+                "success": True,
+                "blob_name": blob_name,
+                "blob_url": self._url(blob_name),
+            }
+
+        except Exception as exc:
+            logger.error(
+                "upload_bytes failed | blob=%s | error=%s",
+                blob_name,
+                str(exc),
+            )
+
+            return {
+                "success": False,
+                "blob_name": blob_name,
+                "error": str(exc),
+            }
 
     def download_bytes(self, blob_name: str) -> bytes:
-        """Download blob → bytes. Raises on failure."""
         blob_client = self.client.get_blob_client(blob_name)
         return blob_client.download_blob().readall()
 
-    def download_to_file(self, blob_name: str, local_path: Path) -> None:
-        """Stream blob to a local file. Raises on failure."""
+    def download_to_file(
+        self,
+        blob_name: str,
+        local_path: Path,
+    ) -> None:
         local_path.parent.mkdir(parents=True, exist_ok=True)
+
         blob_client = self.client.get_blob_client(blob_name)
-        with open(local_path, "wb") as fh:
-            fh.write(blob_client.download_blob().readall())
 
-    # ── Listing ────────────────────────────────────────────────────────────
+        with open(local_path, "wb") as file_handle:
+            file_handle.write(
+                blob_client.download_blob().readall()
+            )
 
-    def list_blobs(self, prefix: Optional[str] = None) -> List[str]:
-        """Return blob names matching an optional prefix."""
+    def list_blobs(
+        self,
+        prefix: Optional[str] = None,
+    ) -> List[str]:
         try:
-            return [b.name for b in self.client.list_blobs(name_starts_with=prefix)]
+            return [
+                blob.name
+                for blob in self.client.list_blobs(
+                    name_starts_with=prefix
+                )
+            ]
+
         except Exception as exc:
-            logger.error("list_blobs failed (prefix=%s): %s", prefix, exc)
+            logger.error(
+                "list_blobs failed | prefix=%s | error=%s",
+                prefix,
+                str(exc),
+            )
             return []
 
-    def list_blob_details(self, prefix: Optional[str] = None) -> List[dict]:
-        """Return blob metadata dicts (name, size, last_modified, content_type)."""
+    def list_blob_details(
+        self,
+        prefix: Optional[str] = None,
+    ) -> List[dict]:
         try:
-            blobs = []
-            for b in self.client.list_blobs(name_starts_with=prefix, include=["metadata"]):
-                blobs.append({
-                    "name":          b.name,
-                    "size_bytes":    b.size,
-                    "last_modified": b.last_modified.isoformat() if b.last_modified else None,
-                    "content_type":  b.content_settings.content_type if b.content_settings else None,
-                })
-            return blobs
+            results = []
+
+            for blob in self.client.list_blobs(
+                name_starts_with=prefix,
+                include=["metadata"],
+            ):
+                results.append(
+                    {
+                        "name": blob.name,
+                        "size_bytes": blob.size,
+                        "last_modified": (
+                            blob.last_modified.isoformat()
+                            if blob.last_modified
+                            else None
+                        ),
+                        "content_type": (
+                            blob.content_settings.content_type
+                            if blob.content_settings
+                            else None
+                        ),
+                    }
+                )
+
+            return results
+
         except Exception as exc:
-            logger.error("list_blob_details failed: %s", exc)
+            logger.error(
+                "list_blob_details failed | error=%s",
+                str(exc),
+            )
             return []
 
-    # ── Existence / deletion ───────────────────────────────────────────────
-
-    def blob_exists(self, blob_name: str) -> bool:
+    def blob_exists(
+        self,
+        blob_name: str,
+    ) -> bool:
         try:
-            self.client.get_blob_client(blob_name).get_blob_properties()
+            self.client.get_blob_client(
+                blob_name
+            ).get_blob_properties()
             return True
         except Exception:
             return False
 
-    def delete_blob(self, blob_name: str) -> bool:
-        """Delete a single blob. Returns True on success."""
+    def delete_blob(
+        self,
+        blob_name: str,
+    ) -> bool:
         try:
             self.client.delete_blob(blob_name)
-            logger.info("Deleted blob: %s", blob_name)
+
+            logger.info(
+                "Deleted blob: %s",
+                blob_name,
+            )
+
             return True
+
         except Exception as exc:
-            logger.error("delete_blob failed '%s': %s", blob_name, exc)
+            logger.error(
+                "delete_blob failed | blob=%s | error=%s",
+                blob_name,
+                str(exc),
+            )
             return False
 
-    def delete_prefix(self, prefix: str) -> int:
-        """Delete all blobs under a prefix. Returns count deleted."""
-        names   = self.list_blobs(prefix)
-        deleted = sum(1 for n in names if self.delete_blob(n))
+    def delete_prefix(
+        self,
+        prefix: str,
+    ) -> int:
+        names = self.list_blobs(prefix)
+        deleted = sum(
+            1 for name in names
+            if self.delete_blob(name)
+        )
         return deleted
 
-    # ── Health check ───────────────────────────────────────────────────────
-
     def ping(self) -> dict:
-        """
-        Lightweight connectivity check.
-        Returns {'ok': True/False, 'account': str, 'container': str, 'error'?: str}.
-        """
         try:
-            props = self.client.get_container_properties()
+            properties = self.client.get_container_properties()
+
             return {
-                "ok":           True,
-                "account":      self.client.account_name,
-                "container":    self._container,
-                "lease_status": props.get("lease", {}).get("status", "unknown"),
+                "ok": True,
+                "account": self.client.account_name,
+                "container": self._container,
+                "lease_status": properties.get(
+                    "lease",
+                    {}
+                ).get(
+                    "status",
+                    "unknown",
+                ),
             }
+
         except Exception as exc:
-            return {"ok": False, "account": "", "container": self._container, "error": str(exc)}
+            return {
+                "ok": False,
+                "account": "",
+                "container": self._container,
+                "error": str(exc),
+            }
 
-    # ── Helpers ────────────────────────────────────────────────────────────
-
-    def _url(self, blob_name: str) -> str:
+    def _url(
+        self,
+        blob_name: str,
+    ) -> str:
         return (
             f"https://{self.client.account_name}.blob.core.windows.net"
             f"/{self._container}/{blob_name}"
         )
+
+
+blob_storage_service = BlobStorageService(
+    connection_string=Config.AZURE_CONNECTION_STRING,
+    container_name=Config.AZURE_BLOB_CONTAINER,
+)
+
+
+def upload_file_to_blob(
+    local_file_path,
+    blob_name,
+):
+    local_path = Path(local_file_path)
+
+    return blob_storage_service.upload_file(
+        local_path=local_path,
+        blob_name=blob_name,
+    )
+
+
+def upload_file_to_blob_for_client(
+    client_id,
+    local_file_path,
+    prefix="raw",
+):
+    local_path = Path(local_file_path)
+
+    return blob_storage_service.upload_file_for_client(
+        client_id=client_id,
+        local_path=local_path,
+        prefix=prefix,
+    )
