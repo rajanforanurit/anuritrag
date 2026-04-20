@@ -5,19 +5,21 @@ Endpoints
 ─────────
 POST /ingest/local-directory   Process all files from a local directory
 POST /ingest/upload-file       Upload + process a single file (multipart)
-POST /ingest/google-drive      Fetch + process all files from a Google Drive folder
+POST /ingest/google-drive      Fetch + process all files from a Google Drive folder (async background)
 POST /ingest/sharepoint        Fetch + process files from SharePoint (requires MSAL config)
 POST /scan-directory           Preview directory contents without ingesting
+GET  /ingest/google-drive/status/{request_id}  Poll job status
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
+import threading
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 
 from api.middleware.auth import require_api_key
 from api.schemas import (
@@ -41,6 +43,11 @@ from utils.helpers import make_doc_id
 logger  = logging.getLogger(__name__)
 router  = APIRouter(prefix="/ingest", tags=["Ingestion"])
 _loader = DocumentLoader()
+
+# ── In-memory job store ────────────────────────────────────────────────────────
+# { request_id: { "status": "pending"|"running"|"done"|"error", "result": {...} } }
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
 
 
 # ── POST /ingest/local-directory ───────────────────────────────────────────────
@@ -178,65 +185,40 @@ async def upload_and_ingest_file(
     )
 
 
-# ── POST /ingest/google-drive ──────────────────────────────────────────────────
+# ── Background worker ──────────────────────────────────────────────────────────
 
-@router.post(
-    "/google-drive",
-    response_model=IngestGoogleDriveResponse,
-    summary="Ingest all documents from a Google Drive folder",
-    description=(
-        "Fetches all supported files from a Google Drive folder (by folder ID), "
-        "downloads them to a temporary directory, then runs the full ingestion pipeline. "
-        "Requires `GOOGLE_SERVICE_ACCOUNT_JSON` in .env. "
-        "The folder ID is the last part of the Drive folder URL: "
-        "`https://drive.google.com/drive/folders/<FOLDER_ID>`"
-    ),
-)
-async def ingest_google_drive(
-    body: IngestGoogleDriveRequest,
-    _key: str = Depends(require_api_key),
-):
-    request_id = str(uuid.uuid4())
-    logger.info("[%s] ingest/google-drive — folder_id=%s", request_id, body.folder_id)
+def _run_gdrive_job(request_id: str, folder_id: str, recursive: bool, extra_meta: dict):
+    """Runs in a background thread — downloads Drive folder and runs pipeline."""
+    import shutil
 
-    # Validate credentials are configured
-    if not Config.GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "Google Drive credentials are not configured. "
-                "Set GOOGLE_SERVICE_ACCOUNT_JSON (service account JSON content) in .env."
-            ),
-        )
+    tmp_dir = Config.TMP_DIR / f"gdrive_{request_id}"
 
-    from services.google_drive_loader import GoogleDriveLoader
-
-    extra_meta = dict(body.extra_metadata or {})
-    if body.label:
-        extra_meta["ingest_label"] = body.label
-    extra_meta["request_id"]    = request_id
-    extra_meta["gdrive_folder"] = body.folder_id
+    with _jobs_lock:
+        _jobs[request_id]["status"] = "running"
 
     try:
-        loader   = GoogleDriveLoader()
-        tmp_dir  = Config.TMP_DIR / f"gdrive_{request_id}"
+        from services.google_drive_loader import GoogleDriveLoader
+
+        loader = GoogleDriveLoader()
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info("[%s] Downloading files from Google Drive folder: %s", request_id, body.folder_id)
+        logger.info("[%s] Downloading files from Google Drive folder: %s", request_id, folder_id)
         downloaded = loader.download_folder(
-            folder_id=body.folder_id,
+            folder_id=folder_id,
             dest_dir=tmp_dir,
-            recursive=body.recursive,
+            recursive=recursive,
         )
 
         if not downloaded:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=(
-                    f"No supported files found in Google Drive folder '{body.folder_id}'. "
-                    f"Supported types: {sorted(Config.SUPPORTED_EXTENSIONS)}"
-                ),
-            )
+            with _jobs_lock:
+                _jobs[request_id] = {
+                    "status": "error",
+                    "detail": (
+                        f"No supported files found in Google Drive folder '{folder_id}'. "
+                        "Make sure the folder is shared with the service account email and contains supported file types."
+                    ),
+                }
+            return
 
         logger.info("[%s] Downloaded %d file(s) — starting pipeline", request_id, len(downloaded))
 
@@ -246,33 +228,110 @@ async def ingest_google_drive(
             extra_metadata=extra_meta,
         )
 
-    except HTTPException:
-        raise
+        if "error" in summary:
+            with _jobs_lock:
+                _jobs[request_id] = {"status": "error", "detail": summary["error"]}
+            return
+
+        summary["status"] = "partial" if summary.get("uploads_failed", 0) else "success"
+        summary["files_found"] = len(downloaded)
+
+        with _jobs_lock:
+            _jobs[request_id] = {"status": "done", "result": summary}
+
+        logger.info("[%s] Google Drive job completed successfully", request_id)
+
     except Exception as exc:
-        logger.exception("[%s] Google Drive ingestion failed", request_id)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Google Drive ingestion failed: {exc}",
-        )
+        logger.exception("[%s] Google Drive background job failed", request_id)
+        with _jobs_lock:
+            _jobs[request_id] = {"status": "error", "detail": str(exc)}
     finally:
-        # Clean up temp downloads
-        import shutil
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    if "error" in summary:
+
+# ── POST /ingest/google-drive ──────────────────────────────────────────────────
+
+@router.post(
+    "/google-drive",
+    summary="Ingest all documents from a Google Drive folder",
+    description=(
+        "Kicks off a background job immediately and returns a request_id. "
+        "Poll GET /ingest/google-drive/status/{request_id} to check progress. "
+        "Requires GOOGLE_SERVICE_ACCOUNT_JSON in Render env vars. "
+        "The folder must be shared with the service account email (Viewer access). "
+        "The folder ID is the last part of the Drive folder URL: "
+        "`https://drive.google.com/drive/folders/<FOLDER_ID>`"
+    ),
+    status_code=202,
+)
+async def ingest_google_drive(
+    body: IngestGoogleDriveRequest,
+    background_tasks: BackgroundTasks,
+    _key: str = Depends(require_api_key),
+):
+    request_id = str(uuid.uuid4())
+    logger.info("[%s] ingest/google-drive — folder_id=%s", request_id, body.folder_id)
+
+    if not Config.GOOGLE_SERVICE_ACCOUNT_JSON:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=summary["error"],
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Google Drive credentials are not configured. "
+                "Set GOOGLE_SERVICE_ACCOUNT_JSON in Render environment variables."
+            ),
         )
 
-    summary["status"] = "partial" if summary.get("uploads_failed", 0) else "success"
-    return IngestGoogleDriveResponse(
+    extra_meta = dict(body.extra_metadata or {})
+    if body.label:
+        extra_meta["ingest_label"] = body.label
+    extra_meta["request_id"]    = request_id
+    extra_meta["gdrive_folder"] = body.folder_id
+
+    with _jobs_lock:
+        _jobs[request_id] = {"status": "pending"}
+
+    background_tasks.add_task(
+        _run_gdrive_job,
         request_id=request_id,
         folder_id=body.folder_id,
-        files_found=len(downloaded),
-        summary=PipelineSummary(**summary),
+        recursive=body.recursive,
+        extra_meta=extra_meta,
     )
+
+    return {
+        "request_id": request_id,
+        "status": "pending",
+        "message": "Job started. Poll the status endpoint to check progress.",
+        "poll_url": f"/ingest/google-drive/status/{request_id}",
+    }
+
+
+# ── GET /ingest/google-drive/status/{request_id} ──────────────────────────────
+
+@router.get(
+    "/google-drive/status/{request_id}",
+    summary="Poll Google Drive ingestion job status",
+    description=(
+        "Returns the current status of a Google Drive ingestion job. "
+        "Status values: pending → running → done | error. "
+        "Note: job state is stored in memory and is lost if the server restarts."
+    ),
+)
+async def gdrive_job_status(
+    request_id: str,
+    _key: str = Depends(require_api_key),
+):
+    with _jobs_lock:
+        job = _jobs.get(request_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No job found for request_id '{request_id}'. Jobs are stored in memory and lost on restart.",
+        )
+
+    return {"request_id": request_id, **job}
 
 
 # ── POST /ingest/sharepoint ────────────────────────────────────────────────────
@@ -298,7 +357,6 @@ async def ingest_sharepoint(
         request_id, body.site_url, body.folder_path,
     )
 
-    # Check credentials
     missing: list[str] = []
     if not Config.SHAREPOINT_TENANT_ID:
         missing.append("SHAREPOINT_TENANT_ID")
