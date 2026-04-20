@@ -5,7 +5,7 @@ import traceback
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
-from services.document_loader import load_documents
+from services.document_loader import DocumentLoader
 from services.chunker import chunk_documents
 from services.embeddings import generate_embeddings
 from services.blob_storage import (
@@ -14,6 +14,10 @@ from services.blob_storage import (
 )
 from utils.helpers import make_doc_id
 from config import Config
+
+_loader = DocumentLoader()
+
+
 def ensure_directory(path: str):
     if path and not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
@@ -55,27 +59,20 @@ def build_client_paths(client_id: str):
 
 
 def upload_original_files(
-    documents: List,
+    raw_documents: List,
     client_id: str,
 ) -> List[str]:
     uploaded_blob_paths = []
 
-    for doc in documents:
+    for doc in raw_documents:
         try:
-            source_path = (
-                doc.metadata.get("source")
-                if hasattr(doc, "metadata")
-                else None
-            )
+            source_file = doc.file_path  # RawDocument uses .file_path
 
-            if not source_path:
+            if not source_file or not Path(source_file).exists():
+                print(f"Skipped missing file: {source_file}")
                 continue
 
-            source_file = Path(source_path)
-
-            if not source_file.exists():
-                print(f"Skipped missing file: {source_path}")
-                continue
+            source_file = Path(source_file)
 
             result = upload_file_to_blob_for_client(
                 client_id=client_id,
@@ -84,21 +81,13 @@ def upload_original_files(
             )
 
             if result.get("success"):
-                uploaded_blob_paths.append(
-                    result.get("blob_name")
-                )
-                print(
-                    f"Uploaded: {source_file.name} -> {result.get('blob_name')}"
-                )
+                uploaded_blob_paths.append(result.get("blob_name"))
+                print(f"Uploaded: {source_file.name} -> {result.get('blob_name')}")
             else:
-                print(
-                    f"Upload failed for {source_file.name}: {result.get('error')}"
-                )
+                print(f"Upload failed for {source_file.name}: {result.get('error')}")
 
         except Exception as exc:
-            print(
-                f"Blob upload failed for file: {str(exc)}"
-            )
+            print(f"Blob upload failed for file: {str(exc)}")
 
     return uploaded_blob_paths
 
@@ -112,9 +101,7 @@ def save_metadata(
     extra_metadata: Dict[str, Any],
     meta_dir: str,
 ):
-    timestamp = datetime.utcnow().strftime(
-        "%Y%m%d_%H%M%S"
-    )
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
     metadata_payload = {
         "client_id": client_id,
@@ -132,10 +119,7 @@ def save_metadata(
         f"ingestion_{timestamp}.json",
     )
 
-    safe_write_json(
-        metadata_path,
-        metadata_payload,
-    )
+    safe_write_json(metadata_path, metadata_payload)
 
     try:
         blob_name = (
@@ -150,18 +134,12 @@ def save_metadata(
         )
 
         if upload_result.get("success"):
-            print(
-                f"Metadata uploaded to blob: {blob_name}"
-            )
+            print(f"Metadata uploaded to blob: {blob_name}")
         else:
-            print(
-                f"Metadata blob upload failed: {upload_result.get('error')}"
-            )
+            print(f"Metadata blob upload failed: {upload_result.get('error')}")
 
     except Exception as exc:
-        print(
-            f"Metadata upload error: {str(exc)}"
-        )
+        print(f"Metadata upload error: {str(exc)}")
 
     return metadata_path
 
@@ -177,16 +155,12 @@ def run_pipeline(
         client_id = extra_metadata.get("client_id")
 
         if not client_id:
-            raise ValueError(
-                "client_id is required inside extra_metadata"
-            )
+            raise ValueError("client_id is required inside extra_metadata")
 
         client_id = client_id.strip().lower()
 
         if not source_path:
-            raise ValueError(
-                "source_path is required"
-            )
+            raise ValueError("source_path is required")
 
         print("\n========== PIPELINE START ==========")
         print(f"Client ID   : {client_id}")
@@ -195,75 +169,67 @@ def run_pipeline(
         print("====================================\n")
 
         paths = build_client_paths(client_id)
-
         client_faiss_dir = paths["faiss_dir"]
         client_meta_dir = paths["meta_dir"]
 
         print("Loading documents...")
 
-        documents = load_documents(str(source_path))
-
-        if not documents:
-            raise Exception(
-                f"No supported documents found in: {source_path}"
-            )
-
-        unique_files = list(
-            set(
-                [
-                    doc.metadata.get("source", "")
-                    for doc in documents
-                    if hasattr(doc, "metadata")
-                ]
-            )
+        # Use DocumentLoader.load_from_directory (RawDocument objects)
+        raw_documents = _loader.load_from_directory(
+            root=Path(source_path),
+            source_type=source_type,
+            extra_metadata=extra_metadata,
         )
 
-        files_processed = len(unique_files)
+        if not raw_documents:
+            raise Exception(f"No supported documents found in: {source_path}")
 
-        print(
-            f"Loaded documents: {files_processed}"
-        )
+        files_processed = len(raw_documents)
+        print(f"Loaded documents: {files_processed}")
 
-        print(
-            "Uploading original files to Azure Blob..."
-        )
+        print("Uploading original files to Azure Blob...")
 
         blob_paths = upload_original_files(
-            documents=documents,
+            raw_documents=raw_documents,
             client_id=client_id,
         )
 
-        print(
-            f"Uploaded files to blob: {len(blob_paths)}"
-        )
+        print(f"Uploaded files to blob: {len(blob_paths)}")
+
+        # Convert RawDocument pages into flat text dicts for chunker
+        # Each item: {"text": str, "metadata": {"source": str, "page": int, ...}}
+        flat_docs = []
+        for raw_doc in raw_documents:
+            for page in raw_doc.pages:
+                flat_docs.append({
+                    "text": page.get("text", ""),
+                    "metadata": {
+                        "source": str(raw_doc.file_path),
+                        "doc_id": raw_doc.doc_id,
+                        "page": page.get("page", 1),
+                        "source_type": raw_doc.source_type,
+                        **raw_doc.extra_metadata,
+                    },
+                })
 
         print("Creating chunks...")
 
-        chunks = chunk_documents(documents)
+        chunks = chunk_documents(flat_docs)
 
         if not chunks:
-            raise Exception(
-                "Chunk creation failed"
-            )
+            raise Exception("Chunk creation failed")
 
         chunks_created = len(chunks)
+        print(f"Chunks created: {chunks_created}")
 
-        print(
-            f"Chunks created: {chunks_created}"
-        )
-
-        print(
-            "Generating embeddings and FAISS..."
-        )
+        print("Generating embeddings and FAISS...")
 
         generate_embeddings(
             chunks=chunks,
             save_path=client_faiss_dir,
         )
 
-        print(
-            f"FAISS saved to: {client_faiss_dir}"
-        )
+        print(f"FAISS saved to: {client_faiss_dir}")
 
         print("Saving metadata...")
 
@@ -280,23 +246,15 @@ def run_pipeline(
             meta_dir=client_meta_dir,
         )
 
-        print(
-            f"Metadata saved: {metadata_path}"
-        )
-
-        print(
-            "\n========== PIPELINE SUCCESS ==========\n"
-        )
+        print(f"Metadata saved: {metadata_path}")
+        print("\n========== PIPELINE SUCCESS ==========\n")
 
         return {
             "run_timestamp": datetime.utcnow().isoformat(),
             "documents_processed": files_processed,
             "total_chunks": chunks_created,
             "uploads_succeeded": len(blob_paths),
-            "uploads_failed": max(
-                0,
-                files_processed - len(blob_paths),
-            ),
+            "uploads_failed": max(0, files_processed - len(blob_paths)),
             "elapsed_seconds": 0.0,
             "per_document": [],
             "upload_errors": [],
@@ -308,14 +266,10 @@ def run_pipeline(
         }
 
     except Exception as exc:
-        print(
-            "\n========== PIPELINE FAILED =========="
-        )
+        print("\n========== PIPELINE FAILED ==========")
         print(str(exc))
         print(traceback.format_exc())
-        print(
-            "=====================================\n"
-        )
+        print("=====================================\n")
 
         return {
             "error": str(exc),
@@ -340,22 +294,15 @@ def run_pipeline_single_file(
     file_path = Path(file_path)
 
     if not file_path.exists():
-        return {
-            "error": f"File not found: {str(file_path)}"
-        }
+        return {"error": f"File not found: {str(file_path)}"}
 
     temp_dir = Config.TMP_DIR / f"single_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
-    temp_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     temp_file = temp_dir / file_path.name
 
     try:
-        temp_file.write_bytes(
-            file_path.read_bytes()
-        )
+        temp_file.write_bytes(file_path.read_bytes())
 
         return run_pipeline(
             source_path=temp_dir,
@@ -364,17 +311,13 @@ def run_pipeline_single_file(
         )
 
     except Exception as exc:
-        return {
-            "error": str(exc)
-        }
+        return {"error": str(exc)}
 
     finally:
         try:
             if temp_file.exists():
                 temp_file.unlink()
-
             if temp_dir.exists():
                 temp_dir.rmdir()
-
         except Exception:
             pass
