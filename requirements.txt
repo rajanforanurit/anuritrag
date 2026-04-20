@@ -34,8 +34,8 @@ markdown
 google-api-python-client
 google-auth
 google-auth-httplib2
-
 msal
+# force rebuild 2026-04-21
 
 requests
 httpx
