@@ -1,23 +1,8 @@
-"""
-api/routers/storage.py
-
-Endpoints
-─────────
-GET  /storage/status            Azure Blob connection health + stats
-GET  /documents                 List all ingested documents
-GET  /document/{doc_id}         Full metadata + chunk list for a document
-DELETE /document/{doc_id}       Remove all blobs for a document
-GET  /chunks/{doc_id}           Raw chunks with text for a document
-POST /rebuild-index             Re-embed one or all documents
-"""
-
 from __future__ import annotations
-
 import json
 import logging
 import time
 from typing import List, Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from api.middleware.auth import require_api_key
@@ -40,8 +25,8 @@ from services.pipeline import get_blob_svc, get_embedder, rebuild_index_for_doc_
 
 logger = logging.getLogger(__name__)
 
-router     = APIRouter(tags=["Storage & Documents"])
-_meta_svc  = MetadataService()
+router    = APIRouter(tags=["Storage & Documents"])
+_meta_svc = MetadataService()
 
 
 # ── GET /storage/status ────────────────────────────────────────────────────────
@@ -51,8 +36,8 @@ _meta_svc  = MetadataService()
     response_model=StorageStatusResponse,
     summary="Azure Blob Storage connection health check",
     description=(
-        "Pings the configured Azure Blob container and returns connection status, "
-        "per-prefix blob counts, and which LLM keys are configured."
+        "Pings the configured Azure Blob container and returns connection status "
+        "and per-prefix blob counts."
     ),
 )
 async def storage_status(_key: str = Depends(require_api_key)):
@@ -80,11 +65,6 @@ async def storage_status(_key: str = Depends(require_api_key)):
         container=ping.get("container"),
         connection_error=ping.get("error"),
         prefixes=prefix_stats,
-        llm_keys_configured={
-            "google_gemini": bool(Config.GOOGLE_API_KEY),
-            "openai":        bool(Config.OPENAI_API_KEY),
-            "azure_openai":  bool(Config.AZURE_OPENAI_API_KEY and Config.AZURE_OPENAI_ENDPOINT),
-        },
     )
 
 
@@ -131,11 +111,10 @@ async def list_documents(_key: str = Depends(require_api_key)):
     ),
 )
 async def get_document(doc_id: str, _key: str = Depends(require_api_key)):
-    blob      = get_blob_svc()
-    meta_blob = Config.BLOB_META_PREFIX + f"{doc_id}_meta.json"
+    blob       = get_blob_svc()
+    meta_blob  = Config.BLOB_META_PREFIX   + f"{doc_id}_meta.json"
     chunk_blob = Config.BLOB_CHUNKS_PREFIX + f"{doc_id}_chunks.jsonl"
 
-    # Load meta
     if not blob.blob_exists(meta_blob):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -148,7 +127,6 @@ async def get_document(doc_id: str, _key: str = Depends(require_api_key)):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read metadata: {exc}")
 
-    # Load chunks for previews
     chunk_summaries: List[ChunkSummary] = []
     if blob.blob_exists(chunk_blob):
         try:
@@ -193,12 +171,9 @@ async def get_document(doc_id: str, _key: str = Depends(require_api_key)):
     ),
 )
 async def delete_document(doc_id: str, _key: str = Depends(require_api_key)):
-    blob = get_blob_svc()
-
-    # Collect all blob names for this doc_id
-    # We need the original filename to find the raw blob — read from meta first
+    blob           = get_blob_svc()
     meta_blob_name = Config.BLOB_META_PREFIX + f"{doc_id}_meta.json"
-    deleted = 0
+    deleted        = 0
     source_file: Optional[str] = None
 
     if blob.blob_exists(meta_blob_name):
@@ -208,16 +183,13 @@ async def delete_document(doc_id: str, _key: str = Depends(require_api_key)):
         except Exception:
             pass
 
-    # Delete chunks JSONL
     chunk_blob = Config.BLOB_CHUNKS_PREFIX + f"{doc_id}_chunks.jsonl"
     if blob.delete_blob(chunk_blob):
         deleted += 1
 
-    # Delete meta JSON
     if blob.delete_blob(meta_blob_name):
         deleted += 1
 
-    # Delete raw file (need original filename from meta)
     if source_file:
         raw_blob = Config.BLOB_RAW_PREFIX + source_file
         if blob.delete_blob(raw_blob):
@@ -308,8 +280,7 @@ async def rebuild_index(
     start = time.time()
 
     if body.doc_id:
-        # Single document
-        result = rebuild_index_for_doc_id(body.doc_id, blob_svc=blob)
+        result  = rebuild_index_for_doc_id(body.doc_id, blob_svc=blob)
         elapsed = time.time() - start
 
         if "error" in result and result["error"]:
@@ -329,7 +300,6 @@ async def rebuild_index(
             status="success",
         )
 
-    # All documents — enumerate from meta/ prefix
     names      = blob.list_blobs(prefix=Config.BLOB_META_PREFIX)
     meta_blobs = [n for n in names if n.endswith("_meta.json")]
 
@@ -339,15 +309,15 @@ async def rebuild_index(
             detail="No documents found in storage. Run an ingestion first.",
         )
 
-    rebuilt: List[str]      = []
-    skipped: List[str]      = []
-    errors: List[dict]      = []
+    rebuilt: List[str] = []
+    skipped: List[str] = []
+    errors:  List[dict] = []
 
     for meta_blob in meta_blobs:
         try:
-            raw     = blob.download_bytes(meta_blob)
-            meta    = json.loads(raw)
-            doc_id  = meta.get("doc_id", "")
+            raw    = blob.download_bytes(meta_blob)
+            meta   = json.loads(raw)
+            doc_id = meta.get("doc_id", "")
             if not doc_id:
                 continue
 
@@ -366,6 +336,7 @@ async def rebuild_index(
 
     elapsed = time.time() - start
     overall = "success" if not errors else ("partial" if rebuilt else "error")
+
     return RebuildIndexResponse(
         rebuilt=rebuilt,
         skipped=skipped,
