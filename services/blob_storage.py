@@ -328,10 +328,9 @@ class BlobStorageService:
             f"/{self._container}/{blob_name}"
         )
 
-
 blob_storage_service = BlobStorageService(
     connection_string=Config.AZURE_CONNECTION_STRING,
-    container_name=Config.AZURE_BLOB_CONTAINER,
+    container_name=Config.AZURE_CONTAINER_NAME,
 )
 
 
