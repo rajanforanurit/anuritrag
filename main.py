@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import asynccontextmanager
+import os
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+from sentence_transformers import SentenceTransformer
 
 from config import Config
 from api.routers import ingest, storage
@@ -17,19 +19,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Global embedding service (set once in lifespan, read by pipeline.py) ──────
-# Previously: embedding_model: SentenceTransformer | None = None
-# Now: a lightweight ONNX-backed service (~35 MB vs ~460 MB)
+# ── Global model ───────────────────────────────────────────────────────────────
 
-from services.embedding import EmbeddingService
-embedding_service: EmbeddingService | None = None
+embedding_model: SentenceTransformer | None = None
 
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global embedding_service
+    global embedding_model
 
     logger.info("═══ RAG Ingestion Pipeline starting ═══")
 
@@ -37,29 +36,21 @@ async def lifespan(app: FastAPI):
     for err in errors:
         logger.warning("⚠  Config: %s", err)
 
-    # ── Load ONNX embedding model ──────────────────────────────────────────
-    # Must happen here (startup), NOT on the first request.
-    # Reason: ORTModelForFeatureExtraction.from_pretrained(export=True) triggers
-    # a one-time HuggingFace → ONNX conversion that spikes memory for ~15-30s.
-    # Doing it at request time would cause an OOM on Render's 512 MB tier.
-    # If the ONNX model was pre-baked into the Docker image (see Dockerfile),
-    # this step just loads the cached file from HF_HOME — fast and cheap.
+    # Preload embedding model (Render-safe)
     try:
         model_name = os.getenv(
             "EMBEDDING_MODEL",
-            "sentence-transformers/all-MiniLM-L12-v2",
+            "sentence-transformers/all-MiniLM-L12-v2"
         )
-        logger.info("Loading ONNX embedding model: %s", model_name)
 
-        embedding_service = EmbeddingService(model_name=model_name)
-        _ = embedding_service.model   # ← triggers export/load NOW, warms up ONNX
+        logger.info("Loading embedding model: %s", model_name)
 
-        logger.info("✔ ONNX embedding model ready")
+        embedding_model = SentenceTransformer(model_name)
+
+        logger.info("✔ Embedding model loaded successfully")
 
     except Exception as exc:
         logger.error("Embedding model failed to load: %s", exc)
-        # Service continues without embeddings — ingestion endpoints will
-        # return a 500 if they attempt to embed.  Health check still passes.
 
     Config.TMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -127,8 +118,4 @@ async def root():
 
 @app.get("/health", tags=["Health"], summary="Liveness probe")
 async def health():
-    model_ok = embedding_service is not None and embedding_service._model is not None
-    return {
-        "status": "ok",
-        "embedding_model": "ready" if model_ok else "not loaded",
-    }
+    return {"status": "ok"}
