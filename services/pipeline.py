@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import json
 import logging
-import tempfile
 import time
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -22,11 +22,11 @@ LogFn = Callable[[str], None]
 
 # ── Shared singleton services (module-level, initialised once) ─────────────────
 
-_blob_svc:   Optional[BlobStorageService] = None
-_embedder:   Optional[EmbeddingService]   = None
-_meta_svc:   MetadataService              = MetadataService()
-_loader:     DocumentLoader               = DocumentLoader()
-_chunker:    Optional[Chunker]            = None
+_blob_svc: Optional[BlobStorageService] = None
+_embedder: Optional[EmbeddingService]   = None
+_meta_svc: MetadataService              = MetadataService()
+_loader:   DocumentLoader               = DocumentLoader()
+_chunker:  Optional[Chunker]            = None
 
 
 def get_blob_svc() -> BlobStorageService:
@@ -38,16 +38,31 @@ def get_blob_svc() -> BlobStorageService:
         )
     return _blob_svc
 
+
 def get_embedder() -> EmbeddingService:
+    """
+    Return the EmbeddingService singleton that was warmed up at startup.
+
+    Previously imported `embedding_model` (a SentenceTransformer instance)
+    from main.py and wrapped it.  Now imports `embedding_service` directly —
+    the EmbeddingService is the singleton itself, no wrapper needed.
+    """
     global _embedder
     if _embedder is None:
-        from main import embedding_model
-        if embedding_model is None:
-            raise RuntimeError("Model not loaded at startup")
+        # Import here (not at module level) to avoid a circular import
+        # between main.py → pipeline.py → main.py.
+        from main import embedding_service
 
-        _embedder = EmbeddingService(model=embedding_model)
+        if embedding_service is None:
+            raise RuntimeError(
+                "EmbeddingService is not loaded. "
+                "Ensure the lifespan startup in main.py completed successfully."
+            )
+
+        _embedder = embedding_service
 
     return _embedder
+
 
 def get_chunker() -> Chunker:
     global _chunker
@@ -76,10 +91,10 @@ def run_pipeline(
         if log_fn:
             log_fn(msg)
 
-    start    = time.time()
-    blob     = blob_svc or get_blob_svc()
-    emb      = embedder  or get_embedder()
-    chunker  = get_chunker()
+    start   = time.time()
+    blob    = blob_svc or get_blob_svc()
+    emb     = embedder  or get_embedder()
+    chunker = get_chunker()
 
     # 1 + 2 — Scan + extract
     log(f"▶ Scanning: {source_path}")
@@ -97,9 +112,9 @@ def run_pipeline(
     log(f"  ✔ {len(docs)} document(s) loaded")
 
     # 3 — Chunk
-    all_chunks: List[Chunk] = []
-    chunk_counts: List[int] = []
-    doc_ids: List[str]      = []
+    all_chunks:   List[Chunk] = []
+    chunk_counts: List[int]   = []
+    doc_ids:      List[str]   = []
 
     for doc in docs:
         chunks = chunker.chunk_document(doc)
@@ -109,7 +124,7 @@ def run_pipeline(
         log(f"  ↳ {doc.doc_id} ({doc.file_path.name}) → {len(chunks)} chunks")
     log(f"  ✔ Total chunks: {len(all_chunks)}")
 
-    # 4 — Embed (attaches vectors to chunk.embedding in place)
+    # 4 — Embed (attaches vectors to chunk.embedding in-place)
     log("▶ Generating embeddings…")
     vectors = emb.embed_chunks(all_chunks, show_progress=False)
     log(f"  ✔ Embedding shape: {vectors.shape}")
@@ -118,7 +133,7 @@ def run_pipeline(
     faiss_path: Optional[Path] = None
     if Config.ENABLE_FAISS_BACKUP:
         try:
-            index     = emb.build_faiss_index(vectors)
+            index      = emb.build_faiss_index(vectors)
             faiss_path = Config.FAISS_INDEX_PATH
             emb.save_faiss_index(index, faiss_path)
             log(f"  ✔ FAISS index saved → {faiss_path}")
@@ -150,8 +165,7 @@ def run_pipeline(
 
     # 8 — Per-document meta JSON
     for doc in docs:
-        meta = _build_doc_meta(doc, chunk_map.get(doc.doc_id, []))
-        import json
+        meta       = _build_doc_meta(doc, chunk_map.get(doc.doc_id, []))
         meta_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode()
         blob_name  = Config.BLOB_META_PREFIX + f"{doc.doc_id}_meta.json"
         r = blob.upload_bytes(meta_bytes, blob_name, content_type="application/json")
@@ -196,8 +210,10 @@ def run_pipeline_single_file(
     log(f"▶ Loading single file: {file_path.name}")
     doc = _loader.load_single_file(file_path, source_type=source_type)
     if doc is None:
-        return {"error": f"Could not extract text from '{file_path.name}'. "
-                         "File may be empty, corrupt, or an unsupported type."}
+        return {
+            "error": f"Could not extract text from '{file_path.name}'. "
+                     "File may be empty, corrupt, or an unsupported type."
+        }
 
     if extra_metadata:
         doc.extra_metadata.update(extra_metadata)
@@ -212,7 +228,6 @@ def run_pipeline_single_file(
 
     # Upload
     upload_results: List[dict] = []
-    import json
 
     r = blob.upload_file(file_path, Config.BLOB_RAW_PREFIX + file_path.name)
     upload_results.append(r)
@@ -224,7 +239,7 @@ def run_pipeline_single_file(
     upload_results.append(r)
     log(f"  {'✔' if r['success'] else '✘'} {blob_name}")
 
-    meta      = _build_doc_meta(doc, chunks)
+    meta       = _build_doc_meta(doc, chunks)
     meta_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode()
     blob_name  = Config.BLOB_META_PREFIX + f"{doc.doc_id}_meta.json"
     r = blob.upload_bytes(meta_bytes, blob_name, content_type="application/json")
@@ -279,15 +294,15 @@ def rebuild_index_for_doc_id(
 
     # Re-upload JSONL with fresh embeddings
     jsonl = _meta_svc.chunks_to_jsonl_bytes(chunks)
-    r = blob.upload_bytes(jsonl, blob_name, content_type="application/x-ndjson")
+    r     = blob.upload_bytes(jsonl, blob_name, content_type="application/x-ndjson")
 
     elapsed = time.time() - start
     return {
-        "doc_id":         doc_id,
-        "chunks_rebuilt": len(chunks),
-        "upload_success": r["success"],
+        "doc_id":          doc_id,
+        "chunks_rebuilt":  len(chunks),
+        "upload_success":  r["success"],
         "elapsed_seconds": round(elapsed, 2),
-        "error":          r.get("error"),
+        "error":           r.get("error"),
     }
 
 
@@ -297,15 +312,15 @@ def _build_doc_meta(doc: RawDocument, chunks: List[Chunk]) -> dict:
     """Build a rich metadata JSON for a processed document."""
     from utils.helpers import utc_now_iso
     return {
-        "doc_id":          doc.doc_id,
-        "source_file":     doc.file_path.name,
-        "source_type":     doc.source_type,
-        "total_pages":     doc.total_pages,
-        "total_chunks":    len(chunks),
-        "total_chars":     sum(c.char_count for c in chunks),
-        "processed_at":    utc_now_iso(),
-        "chunk_ids":       [c.chunk_id for c in chunks],
-        "extra_metadata":  doc.extra_metadata,
+        "doc_id":         doc.doc_id,
+        "source_file":    doc.file_path.name,
+        "source_type":    doc.source_type,
+        "total_pages":    doc.total_pages,
+        "total_chunks":   len(chunks),
+        "total_chars":    sum(c.char_count for c in chunks),
+        "processed_at":   utc_now_iso(),
+        "chunk_ids":      [c.chunk_id for c in chunks],
+        "extra_metadata": doc.extra_metadata,
         "blob_urls": {
             "raw":    f"{Config.BLOB_RAW_PREFIX}{doc.file_path.name}",
             "chunks": f"{Config.BLOB_CHUNKS_PREFIX}{doc.doc_id}_chunks.jsonl",
