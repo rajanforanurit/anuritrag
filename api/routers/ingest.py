@@ -63,11 +63,13 @@ async def ingest_local_directory(
         body.directory_path,
     )
 
-    if not body.client_id:
+    if not body.client_id or not body.client_id.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="client_id is required",
         )
+
+    client_id = body.client_id.strip().lower()
 
     path, err = Config.resolve_local_path(body.directory_path)
 
@@ -89,25 +91,29 @@ async def ingest_local_directory(
         )
 
     extra_meta = dict(body.extra_metadata or {})
+    extra_meta["client_id"] = client_id
+    extra_meta["request_id"] = request_id
 
     if body.label:
         extra_meta["ingest_label"] = body.label
 
-    extra_meta["request_id"] = request_id
-    extra_meta["client_id"] = body.client_id
-
     summary = run_pipeline(
-        client_id=body.client_id,
-        directory_path=str(path),
-        label=body.label,
+        source_path=path,
+        source_type="local",
         extra_metadata=extra_meta,
     )
 
-    if not summary.get("success"):
+    if "error" in summary:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=summary.get("error") or "Pipeline failed",
         )
+
+    summary["status"] = (
+        "partial"
+        if summary.get("uploads_failed", 0)
+        else "success"
+    )
 
     return IngestDirectoryResponse(
         request_id=request_id,
@@ -136,7 +142,7 @@ async def upload_and_ingest_file(
         file.filename,
     )
 
-    if not client_id.strip():
+    if not client_id or not client_id.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="client_id is required",
@@ -169,39 +175,47 @@ async def upload_and_ingest_file(
         )
 
     Config.TMP_DIR.mkdir(parents=True, exist_ok=True)
+
     tmp_path = Config.TMP_DIR / f"{request_id}{suffix}"
 
     try:
         tmp_path.write_bytes(content)
 
         doc_id = make_doc_id(
-            tmp_path.with_stem(Path(file.filename).stem)
+            tmp_path.with_stem(
+                Path(file.filename).stem
+            )
         )
 
         extra_meta = {
-            "request_id": request_id,
             "client_id": client_id,
+            "request_id": request_id,
             "original_filename": file.filename,
         }
 
         if label:
             extra_meta["ingest_label"] = label
 
-        summary = run_pipeline(
-            client_id=client_id,
-            directory_path=str(tmp_path.parent),
-            label=label or "upload-ingestion",
+        summary = run_pipeline_single_file(
+            file_path=tmp_path,
+            source_type="upload",
             extra_metadata=extra_meta,
         )
 
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    if not summary.get("success"):
+    if "error" in summary:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=summary.get("error") or "Upload ingestion failed",
         )
+
+    summary["status"] = (
+        "partial"
+        if summary.get("uploads_failed", 0)
+        else "success"
+    )
 
     return UploadFileResponse(
         request_id=request_id,
@@ -228,7 +242,11 @@ def _run_gdrive_job(
 
     try:
         loader = GoogleDriveLoader()
-        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        tmp_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         downloaded = loader.download_folder(
             folder_id=folder_id,
@@ -245,19 +263,24 @@ def _run_gdrive_job(
             return
 
         summary = run_pipeline(
-            client_id=client_id,
-            directory_path=str(tmp_dir),
-            label="google-drive-ingestion",
+            source_path=tmp_dir,
+            source_type="google_drive",
             extra_metadata=extra_meta,
         )
 
-        if not summary.get("success"):
+        if "error" in summary:
             with _jobs_lock:
                 _jobs[request_id] = {
                     "status": "error",
                     "detail": summary.get("error"),
                 }
             return
+
+        summary["status"] = (
+            "partial"
+            if summary.get("uploads_failed", 0)
+            else "success"
+        )
 
         summary["files_found"] = len(downloaded)
 
@@ -268,7 +291,10 @@ def _run_gdrive_job(
             }
 
     except Exception as exc:
-        logger.exception("[%s] Google Drive ingestion failed", request_id)
+        logger.exception(
+            "[%s] Google Drive ingestion failed",
+            request_id,
+        )
 
         with _jobs_lock:
             _jobs[request_id] = {
@@ -278,7 +304,10 @@ def _run_gdrive_job(
 
     finally:
         if tmp_dir.exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(
+                tmp_dir,
+                ignore_errors=True,
+            )
 
 
 @router.post(
@@ -300,11 +329,13 @@ async def ingest_google_drive(
         body.folder_id,
     )
 
-    if not body.client_id:
+    if not body.client_id or not body.client_id.strip():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="client_id is required",
         )
+
+    client_id = body.client_id.strip().lower()
 
     if not Config.GOOGLE_SERVICE_ACCOUNT_JSON:
         raise HTTPException(
@@ -313,13 +344,12 @@ async def ingest_google_drive(
         )
 
     extra_meta = dict(body.extra_metadata or {})
+    extra_meta["client_id"] = client_id
+    extra_meta["request_id"] = request_id
+    extra_meta["gdrive_folder"] = body.folder_id
 
     if body.label:
         extra_meta["ingest_label"] = body.label
-
-    extra_meta["request_id"] = request_id
-    extra_meta["client_id"] = body.client_id
-    extra_meta["gdrive_folder"] = body.folder_id
 
     with _jobs_lock:
         _jobs[request_id] = {
@@ -329,7 +359,7 @@ async def ingest_google_drive(
     background_tasks.add_task(
         _run_gdrive_job,
         request_id=request_id,
-        client_id=body.client_id,
+        client_id=client_id,
         folder_id=body.folder_id,
         recursive=body.recursive,
         extra_meta=extra_meta,
