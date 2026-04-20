@@ -5,11 +5,13 @@ import traceback
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from pathlib import Path
+
 from services.document_loader import DocumentLoader
 from services.chunking import Chunker
 from services.embedding import EmbeddingService
-# error fixed
 from services.blob_storage import (
+    BlobStorageService,
+    blob_storage_service,
     upload_file_to_blob,
     upload_file_to_blob_for_client,
 )
@@ -308,3 +310,82 @@ def run_pipeline_single_file(
                 temp_dir.rmdir()
         except Exception:
             pass
+
+
+# ── Service accessors (used by storage.py router) ─────────────────────────────
+
+def get_blob_svc() -> BlobStorageService:
+    """Return the shared BlobStorageService singleton."""
+    return blob_storage_service
+
+
+def get_embedder() -> EmbeddingService:
+    """Return the shared EmbeddingService singleton."""
+    return _embedder
+
+
+def rebuild_index_for_doc_id(
+    doc_id: str,
+    blob_svc: BlobStorageService = None,
+) -> dict:
+    """
+    Re-download chunks for a doc_id from Azure Blob, regenerate embeddings,
+    and re-upload the updated chunk JSONL.
+    """
+    from services.chunking import Chunk
+
+    blob = blob_svc or blob_storage_service
+
+    try:
+        chunk_blob_name = Config.BLOB_CHUNKS_PREFIX + f"{doc_id}_chunks.jsonl"
+
+        if not blob.blob_exists(chunk_blob_name):
+            return {"error": f"No chunks found in blob for doc_id '{doc_id}'"}
+
+        # Download existing chunks JSONL
+        raw_bytes = blob.download_bytes(chunk_blob_name)
+        lines     = raw_bytes.decode("utf-8").strip().splitlines()
+
+        chunks: list[Chunk] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            chunks.append(Chunk(
+                doc_id       = data.get("doc_id", doc_id),
+                chunk_id     = data.get("chunk_id", ""),
+                chunk_index  = data.get("chunk_index", 0),
+                text         = data.get("text", ""),
+                page         = data.get("page", 1),
+                source_file  = data.get("source_file", ""),
+                source_type  = data.get("source_type", "local"),
+                uploaded_at  = data.get("uploaded_at", ""),
+                char_count   = data.get("char_count", 0),
+                extra_metadata=data.get("extra_metadata", {}),
+            ))
+
+        if not chunks:
+            return {"error": f"No chunks could be parsed for doc_id '{doc_id}'"}
+
+        # Re-embed
+        vectors = _embedder.embed_chunks(chunks)
+
+        # Re-upload chunks JSONL (embeddings are attached to chunk objects)
+        updated_jsonl = "\n".join(
+            json.dumps(c.to_dict(), ensure_ascii=False) for c in chunks
+        ).encode("utf-8")
+
+        blob.upload_bytes(
+            data         = updated_jsonl,
+            blob_name    = chunk_blob_name,
+            content_type = "application/jsonl",
+            overwrite    = True,
+        )
+
+        logger.info("Rebuilt index for doc_id=%s (%d chunks)", doc_id, len(chunks))
+        return {"doc_id": doc_id, "chunks_rebuilt": len(chunks)}
+
+    except Exception as exc:
+        logger.exception("rebuild_index_for_doc_id failed for %s", doc_id)
+        return {"error": str(exc)}
