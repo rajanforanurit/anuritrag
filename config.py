@@ -1,16 +1,8 @@
-"""
-config.py — Centralised configuration loaded from environment / .env file.
-"""
-
 from __future__ import annotations
-
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-
 load_dotenv()
-
-
 class Config:
     # ── Project layout ──────────────────────────────────────────────────────
     BASE_DIR: Path = Path(__file__).parent
@@ -32,7 +24,7 @@ class Config:
 
     # ── Chunking ────────────────────────────────────────────────────────────
     CHUNK_SIZE:    int = int(os.getenv("CHUNK_SIZE", "500"))
-    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "50"))
+    CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "2"))
 
     # ── FAISS ───────────────────────────────────────────────────────────────
     ENABLE_FAISS_BACKUP: bool = (
