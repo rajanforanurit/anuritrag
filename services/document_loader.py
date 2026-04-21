@@ -1,19 +1,4 @@
-"""
-services/document_loader.py — Universal document text extractor.
-
-Supported file types (industry-standard coverage):
-  Documents    : PDF, DOCX, DOC, TXT, RTF, ODT
-  Spreadsheets : XLSX, XLS, ODS, CSV, TSV
-  Presentations: PPTX, PPT
-  Web/Markup   : HTML, HTM, XML, MD, MARKDOWN, RST
-  Data         : JSON, JSONL, YAML, YML, TOML
-  Code         : PY, JS, TS, JSX, TSX, JAVA, CPP, C, H, CS, GO, RB, PHP, SWIFT, KT, R, SQL, SH, BASH, PS1
-  eBook        : EPUB
-  Email        : EML
-"""
-
 from __future__ import annotations
-
 import json
 import logging
 from dataclasses import dataclass, field
@@ -21,9 +6,6 @@ from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
-
-# ── All supported extensions ────────────────────────────────────────────────────
-
 SUPPORTED_EXTENSIONS: set = {
     # Documents
     ".pdf", ".docx", ".doc", ".txt", ".rtf", ".odt",
@@ -45,15 +27,11 @@ SUPPORTED_EXTENSIONS: set = {
     # Email
     ".eml",
 }
-
-
-# ── Raw document dataclass ──────────────────────────────────────────────────────
-
 @dataclass
 class RawDocument:
     file_path: Path
     doc_id: str
-    pages: List[dict]           # list of {"page": int, "text": str, ...}
+    pages: List[dict] 
     total_pages: int = 0
     source_type: str = "local"
     extra_metadata: dict = field(default_factory=dict)
@@ -207,6 +185,25 @@ def _load_ppt(path: Path) -> List[dict]:
         pass
     return []
 
+def _serialise_df_rows(df) -> str:
+    """
+    Turn a DataFrame into one labelled line per row.
+    Empty cells are skipped so chunks stay compact.
+    Returns a newline-joined string ready to be stored as page text.
+    """
+    import pandas as pd
+    lines = []
+    columns = [str(c) for c in df.columns]
+    for _, row in df.fillna("").astype(str).iterrows():
+        parts = [
+            f"{col}: {val.strip()}"
+            for col, val in zip(columns, row)
+            if val.strip()
+        ]
+        if parts:
+            lines.append(" | ".join(parts))
+    return "\n".join(lines)
+
 
 def _load_excel(path: Path) -> List[dict]:
     import pandas as pd
@@ -219,10 +216,14 @@ def _load_excel(path: Path) -> List[dict]:
             df = pd.read_excel(path, sheet_name=sheet_name, engine=engine)
             if df.empty:
                 continue
-            header = " | ".join(str(c) for c in df.columns)
-            rows   = df.fillna("").astype(str).apply(lambda r: " | ".join(r), axis=1)
-            text   = header + "\n" + "\n".join(rows)
-            pages.append({"page": i, "sheet_name": str(sheet_name), "text": text.strip()})
+            # FIX: use self-describing rows instead of a separate header line
+            text = _serialise_df_rows(df)
+            if text:
+                pages.append({
+                    "page": i,
+                    "sheet_name": str(sheet_name),
+                    "text": text,
+                })
     except Exception as exc:
         logger.error("Excel extraction failed for %s: %s", path.name, exc)
     return pages
@@ -241,10 +242,9 @@ def _load_csv(path: Path) -> List[dict]:
                 continue
         if df is None or df.empty:
             return []
-        header = " | ".join(str(c) for c in df.columns)
-        rows   = df.fillna("").astype(str).apply(lambda r: " | ".join(r), axis=1)
-        text   = header + "\n" + "\n".join(rows)
-        return [{"page": 1, "text": text.strip()}]
+        # FIX: use self-describing rows instead of a separate header line
+        text = _serialise_df_rows(df)
+        return [{"page": 1, "text": text}] if text else []
     except Exception as exc:
         logger.error("CSV extraction failed for %s: %s", path.name, exc)
         return []
@@ -256,10 +256,9 @@ def _load_tsv(path: Path) -> List[dict]:
         df = pd.read_csv(path, sep="\t", encoding="utf-8", errors="replace")
         if df.empty:
             return []
-        header = " | ".join(str(c) for c in df.columns)
-        rows   = df.fillna("").astype(str).apply(lambda r: " | ".join(r), axis=1)
-        text   = header + "\n" + "\n".join(rows)
-        return [{"page": 1, "text": text.strip()}]
+        # FIX: use self-describing rows instead of a separate header line
+        text = _serialise_df_rows(df)
+        return [{"page": 1, "text": text}] if text else []
     except Exception as exc:
         logger.error("TSV extraction failed for %s: %s", path.name, exc)
         return []
