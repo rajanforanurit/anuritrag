@@ -10,6 +10,7 @@ sentence-transformers==2.7.0
 faiss-cpu
 langchain-text-splitters
 pandas
+
 openpyxl
 xlrd
 odfpy
@@ -23,6 +24,8 @@ lxml
 striprtf
 pyyaml
 tomli
+#for new acions
+
 markdown
 google-api-python-client
 google-auth
