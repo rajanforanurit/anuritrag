@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from sentence_transformers import SentenceTransformer
 from config import Config
 from api.routers import ingest, storage
+from fastapi import Body
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
@@ -81,6 +82,7 @@ async def root():
         "service": "RAG Ingestion Pipeline API",
         "version": "3.0.0",
         "vector_store": "Azure AI Search",
+        "model":"Ask Data",
         "docs": "/docs",
         "health": "/health",
         "search_health": "/search/health",
@@ -88,6 +90,20 @@ async def root():
 @app.get("/health", tags=["Health"])
 async def health():
     return {"status": "ok"}
+
+@app.post("/embed", tags=["Utility"])
+async def embed_query(payload: dict = Body(...)):
+    """
+    Embed a single query string using the loaded SentenceTransformer model.
+    Called by the Node.js query server to get consistent embeddings.
+    """
+    from services.pipeline import get_embedder
+    query = payload.get("text", "")
+    if not query:
+        return {"embedding": []}
+    embedder = get_embedder()
+    vec = embedder.embed_query(query)
+    return {"embedding": vec.tolist()}
 
 @app.get("/search/health", tags=["Health"])
 async def search_health():
