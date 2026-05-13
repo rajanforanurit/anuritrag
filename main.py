@@ -3,11 +3,9 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 import os
-
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-
 from sentence_transformers import SentenceTransformer
 
 from config import Config
@@ -18,13 +16,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# ── Global model ───────────────────────────────────────────────────────────────
-
 embedding_model: SentenceTransformer | None = None
-
-
-# ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,7 +28,6 @@ async def lifespan(app: FastAPI):
     for err in errors:
         logger.warning("⚠  Config: %s", err)
 
-    # Preload embedding model (Render-safe)
     try:
         model_name = os.getenv(
             "EMBEDDING_MODEL",
@@ -57,9 +48,6 @@ async def lifespan(app: FastAPI):
     logger.info("═══ Pipeline ready ═══")
     yield
     logger.info("═══ RAG Ingestion Pipeline shutting down ═══")
-
-
-# ── App ────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="RAG Ingestion Pipeline API",
