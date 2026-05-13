@@ -4,7 +4,6 @@ import logging
 import time
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-
 from api.middleware.auth import require_api_key
 from api.schemas import (
     BlobPrefixStats,
@@ -22,15 +21,9 @@ from api.schemas import (
 from config import Config
 from services.metadata import MetadataService
 from services.pipeline import get_blob_svc, get_embedder, rebuild_index_for_doc_id
-
 logger = logging.getLogger(__name__)
-
 router    = APIRouter(tags=["Storage & Documents"])
 _meta_svc = MetadataService()
-
-
-# ── GET /storage/status ────────────────────────────────────────────────────────
-
 @router.get(
     "/storage/status",
     response_model=StorageStatusResponse,
@@ -67,9 +60,6 @@ async def storage_status(_key: str = Depends(require_api_key)):
         prefixes=prefix_stats,
     )
 
-
-# ── GET /documents ─────────────────────────────────────────────────────────────
-
 @router.get(
     "/documents",
     response_model=DocumentListResponse,
@@ -97,9 +87,6 @@ async def list_documents(_key: str = Depends(require_api_key)):
             logger.warning("Could not parse meta blob '%s': %s", blob_name, exc)
 
     return DocumentListResponse(total=len(items), documents=items)
-
-
-# ── GET /document/{doc_id} ─────────────────────────────────────────────────────
 
 @router.get(
     "/document/{doc_id}",
@@ -157,61 +144,85 @@ async def get_document(doc_id: str, _key: str = Depends(require_api_key)):
         chunks=chunk_summaries,
         extra_metadata=meta.get("extra_metadata", {}),
     )
-
-
-# ── DELETE /document/{doc_id} ──────────────────────────────────────────────────
-
 @router.delete(
     "/document/{doc_id}",
     response_model=DeleteDocumentResponse,
-    summary="Delete all blobs for a document",
+    summary="Delete document from Blob and Azure AI Search",
     description=(
-        "Removes the raw file, chunk JSONL, and meta JSON from Azure Blob Storage. "
-        "This is irreversible."
+        "Removes the raw file, chunk JSONL, and meta JSON from Azure Blob Storage "
+        "AND deletes all indexed chunks from Azure AI Search. This is irreversible."
     ),
 )
 async def delete_document(doc_id: str, _key: str = Depends(require_api_key)):
+    from services.azure_search import delete_chunks_by_doc
+
     blob           = get_blob_svc()
     meta_blob_name = Config.BLOB_META_PREFIX + f"{doc_id}_meta.json"
-    deleted        = 0
+    blobs_deleted  = 0
+    search_deleted = 0
     source_file: Optional[str] = None
-
+    client_id: Optional[str]   = None                  
     if blob.blob_exists(meta_blob_name):
         try:
             meta        = json.loads(blob.download_bytes(meta_blob_name))
             source_file = meta.get("source_file")
-        except Exception:
-            pass
+            client_id   = (
+                meta.get("client_id")               
+                or meta.get("extra_metadata", {}).get("client_id") 
+            )
+        except Exception as exc:
+            logger.warning("Could not read meta for %s: %s", doc_id, exc)
+
+    if client_id:
+        try:
+            result         = delete_chunks_by_doc(doc_id=doc_id, client_id=client_id)
+            search_deleted = result.get("deleted", 0)
+            logger.info(
+                "Deleted %d search chunks for doc_id=%s client_id=%s",
+                search_deleted, doc_id, client_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "Azure AI Search delete failed for doc_id=%s: %s",
+                doc_id, exc,
+            )
+    else:
+        logger.warning(
+            "No client_id found for doc_id=%s — skipping Azure AI Search delete. "
+            "Chunks may remain in the index.",
+            doc_id,
+        )
 
     chunk_blob = Config.BLOB_CHUNKS_PREFIX + f"{doc_id}_chunks.jsonl"
     if blob.delete_blob(chunk_blob):
-        deleted += 1
+        blobs_deleted += 1
 
     if blob.delete_blob(meta_blob_name):
-        deleted += 1
+        blobs_deleted += 1
 
     if source_file:
         raw_blob = Config.BLOB_RAW_PREFIX + source_file
         if blob.delete_blob(raw_blob):
-            deleted += 1
-
-    if deleted == 0:
+            blobs_deleted += 1
+    if blobs_deleted == 0 and search_deleted == 0:
         return DeleteDocumentResponse(
             doc_id=doc_id,
             blobs_deleted=0,
+            search_chunks_deleted=0,
             status="not_found",
-            message=f"No blobs found for doc_id '{doc_id}'.",
+            message=f"Nothing found to delete for doc_id '{doc_id}'.",
         )
 
     return DeleteDocumentResponse(
         doc_id=doc_id,
-        blobs_deleted=deleted,
+        blobs_deleted=blobs_deleted,
+        search_chunks_deleted=search_deleted,
         status="success",
-        message=f"Deleted {deleted} blob(s) for '{doc_id}'.",
+        message=(
+            f"Deleted {blobs_deleted} blob(s) and "
+            f"{search_deleted} search chunk(s) for '{doc_id}'."
+        ),
     )
-
-
-# ── GET /chunks/{doc_id} ───────────────────────────────────────────────────────
 
 @router.get(
     "/chunks/{doc_id}",
