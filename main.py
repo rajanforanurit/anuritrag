@@ -13,7 +13,6 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
 )
 logger = logging.getLogger(__name__)
-
 embedding_model: SentenceTransformer | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -31,8 +30,6 @@ async def lifespan(app: FastAPI):
         logger.info("✔ Embedding model loaded")
     except Exception as exc:
         logger.error("Embedding model failed to load: %s", exc)
-
-    # Create Azure AI Search index if not exists
     try:
         from services.azure_search import create_index
         create_index()
